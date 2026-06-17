@@ -1,0 +1,15 @@
+
+sqlalchemy
+psycopg2-binary
+python-dotenv
+numpy
+aiofiles
+Pillow
+opencv-python-headless
+insightface
+onnxruntime
+celery
+redis
+boto3
+google-api-python-client
+
