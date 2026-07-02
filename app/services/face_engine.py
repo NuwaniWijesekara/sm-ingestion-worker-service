@@ -18,9 +18,10 @@ class FaceEngine:
         if self._app is not None:
             return
         from insightface.app import FaceAnalysis
+        from ..config.settings import settings
         logger.info("Loading InsightFace ArcFace model...")
         self._app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-        self._app.prepare(ctx_id=0, det_size=(640, 640))
+        self._app.prepare(ctx_id=0, det_size=(settings.face_det_size, settings.face_det_size), det_thresh=settings.face_det_thresh)
         logger.info("InsightFace model loaded")
 
     def _to_bgr(self, image_bytes: bytes) -> np.ndarray:

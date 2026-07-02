@@ -2,6 +2,13 @@
 worker.py — Redis Stream consumer (replaces Celery)
 Listens on 'photo.ingest' stream, processes each event.
 """
+import socket
+# Force IPv4 to prevent connection timeouts on systems with broken IPv6 routing
+orig_getaddrinfo = socket.getaddrinfo
+def patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+socket.getaddrinfo = patched_getaddrinfo
+
 import logging, time
 import redis
 from sqlalchemy import create_engine, text, Column, String, DateTime, Enum as SAEnum, ForeignKey, Integer
@@ -107,12 +114,21 @@ def ingest_event(event_id: str, drive_url: str):
                 # ArcFace embeddings
                 embeddings = face_engine.extract_embeddings(image_bytes)
 
-                img = Image(
-                    event_id=event_id, s3_url=s3_url, thumbnail_url=thumb_url,
-                    filename=file['name'],
-                    face_embedding=embeddings[0].tolist() if embeddings else None
-                )
-                db.add(img)
+                if embeddings:
+                    for emb in embeddings:
+                        img = Image(
+                            event_id=event_id, s3_url=s3_url, thumbnail_url=thumb_url,
+                            filename=file['name'],
+                            face_embedding=emb.tolist()
+                        )
+                        db.add(img)
+                else:
+                    img = Image(
+                        event_id=event_id, s3_url=s3_url, thumbnail_url=thumb_url,
+                        filename=file['name'],
+                        face_embedding=None
+                    )
+                    db.add(img)
                 db.commit()
 
                 processed += 1
