@@ -12,5 +12,7 @@ class Settings(BaseSettings):
     stream_name:          str = "photo.ingest"
     consumer_group:       str = "ingestion-workers"
     consumer_name:        str = "worker-1"
+    face_det_size:        int = 1024
+    face_det_thresh:      float = 0.4
 
 settings = Settings()

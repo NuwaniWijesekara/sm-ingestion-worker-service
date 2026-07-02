@@ -1,4 +1,3 @@
-
 sqlalchemy
 psycopg2-binary
 python-dotenv
@@ -12,4 +11,6 @@ celery
 redis
 boto3
 google-api-python-client
-
+pgvector
+pydantic
+pydantic-settings
