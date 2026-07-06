@@ -1,7 +1,4 @@
-"""
-worker.py — Redis Stream consumer (replaces Celery)
-Listens on 'photo.ingest' stream, processes each event.
-"""
+
 import socket
 # Force IPv4 to prevent connection timeouts on systems with broken IPv6 routing
 orig_getaddrinfo = socket.getaddrinfo
@@ -10,8 +7,9 @@ def patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
 socket.getaddrinfo = patched_getaddrinfo
 
 import logging, time
+from pathlib import Path
 import redis
-from sqlalchemy import create_engine, text, Column, String, DateTime, Enum as SAEnum, ForeignKey, Integer
+from sqlalchemy import JSON, create_engine, text, Column, String, DateTime, Enum as SAEnum, ForeignKey, Integer
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base
 from pgvector.sqlalchemy import Vector
 import uuid, enum
@@ -25,7 +23,7 @@ from .services.face_engine import face_engine
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── DB Models (read/write events + images) ─────────────────────
+# DB Models (read/write events + images)
 Base = declarative_base()
 def _uuid(): return str(uuid.uuid4())
 
@@ -47,6 +45,7 @@ class Event(Base):
     photographer_id = Column(String, nullable=True)
     created_at      = Column(DateTime, default=datetime.utcnow)
     total_photos    = Column(Integer, default=0)
+    failed_files    = Column(JSON, nullable=True)
     images          = relationship("Image", back_populates="event", cascade="all, delete-orphan")
 
 class Image(Base):
@@ -56,14 +55,23 @@ class Image(Base):
     s3_url         = Column(String, nullable=False)
     thumbnail_url  = Column(String, nullable=True)
     filename       = Column(String, nullable=False)
-    face_embedding = Column(Vector(512), nullable=True)
     created_at     = Column(DateTime, default=datetime.utcnow)
     event          = relationship("Event", back_populates="images")
+    faces          = relationship("Face", back_populates="image", cascade="all, delete-orphan")
+
+class Face(Base):
+    """One row per detected face — embedding only, indexable for ANN search."""
+    __tablename__ = "faces"
+    id             = Column(String, primary_key=True, default=_uuid)
+    image_id       = Column(String, ForeignKey("images.id", ondelete="CASCADE"), nullable=False, index=True)
+    embedding      = Column(Vector(512), nullable=False)
+    created_at     = Column(DateTime, default=datetime.utcnow)
+    image          = relationship("Image", back_populates="faces")
 
 engine = create_engine(settings.database_url, pool_pre_ping=True)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# ── Redis Stream setup ─────────────────────────────────────────
+#Redis Stream setup 
 r = redis.from_url( settings.redis_url,
     decode_responses=True,
     socket_timeout=10,          # wait up to 10s for a response
@@ -80,11 +88,12 @@ def ensure_stream_group():
         else:
             raise
 
-# ── Core ingestion logic ───────────────────────────────────────
+# Core ingestion logic 
 def ingest_event(event_id: str, drive_url: str):
     db = SessionLocal()
     processed = 0
     faces_found = 0
+    failed_files = []
     try:
         event = db.query(Event).filter(Event.id == event_id).first()
         if not event:
@@ -94,58 +103,67 @@ def ingest_event(event_id: str, drive_url: str):
         event.status = EventStatus.PROCESSING
         db.commit()
 
+        deleted = db.query(Image).filter(Image.event_id == event_id).delete()
+        db.commit()
+        if deleted:
+            logger.info(f"Cleared {deleted} existing image(s) before re-ingestion")
+
+
         folder_id = drive_service.extract_folder_id(drive_url)
         files = drive_service.list_images(folder_id)
         logger.info(f"Found {len(files)} images in Drive folder")
 
         for file in files:
+            original_name = file.get('name', 'unknown')
             try:
                 image_bytes = drive_service.download_to_memory(file['id']).getvalue()
 
-                # Upload original (EXIF stripped) to S3
-                photo_key = f"events/{event_id}/photos/{file['name']}"
-                s3_url = s3_service.strip_exif_and_upload(image_bytes, photo_key)
+                base_name = Path(original_name).stem
+                photo_key = f"events/{event_id}/photos/{base_name}.jpg"
+                thumb_key = f"events/{event_id}/thumbs/thumb_{base_name}.jpg"
 
-                # Thumbnail
+                s3_url = s3_service.strip_exif_and_upload(image_bytes, photo_key)
                 thumb_bytes = s3_service.make_thumbnail(image_bytes)
-                thumb_key = f"events/{event_id}/thumbs/thumb_{file['name']}"
                 thumb_url = s3_service.upload_thumbnail(thumb_bytes, thumb_key)
 
-                # ArcFace embeddings
                 embeddings = face_engine.extract_embeddings(image_bytes)
 
-                if embeddings:
-                    for emb in embeddings:
-                        img = Image(
-                            event_id=event_id, s3_url=s3_url, thumbnail_url=thumb_url,
-                            filename=file['name'],
-                            face_embedding=emb.tolist()
-                        )
-                        db.add(img)
-                else:
-                    img = Image(
-                        event_id=event_id, s3_url=s3_url, thumbnail_url=thumb_url,
-                        filename=file['name'],
-                        face_embedding=None
-                    )
-                    db.add(img)
+                # One Image row per photo — always created, regardless of face count
+                img = Image(
+                    event_id=event_id, s3_url=s3_url, thumbnail_url=thumb_url,
+                    filename=original_name
+                )
+                db.add(img)
+                db.flush()  # get img.id before creating Face rows
+
+                # One Face row per detected embedding
+                for emb in embeddings:
+                    face = Face(image_id=img.id, embedding=emb.tolist())
+                    db.add(face)
+
                 db.commit()
 
                 processed += 1
                 faces_found += len(embeddings)
-                logger.info(f"✓ {file['name']}: {len(embeddings)} face(s)")
+                logger.info(f"✓ {original_name}: {len(embeddings)} face(s)")
 
             except Exception as e:
-                logger.error(f"Failed to process {file.get('name')}: {e}")
+                logger.error(f"Failed to process {original_name}: {e}")
+                failed_files.append(original_name)
+                db.rollback()
                 continue
 
         event.status = EventStatus.READY
         event.total_photos = processed
+        event.failed_files = failed_files or None 
         if not event.cover_photo_url:
             first = db.query(Image).filter(Image.event_id == event_id).first()
             if first:
                 event.cover_photo_url = first.thumbnail_url
         db.commit()
+        
+        if failed_files:
+            logger.warning(f"⚠️ {len(failed_files)} file(s) failed: {failed_files}")
         logger.info(f"✅ Ingestion complete: {processed} photos, {faces_found} faces")
 
     except Exception as e:
@@ -159,7 +177,7 @@ def ingest_event(event_id: str, drive_url: str):
     finally:
         db.close()
 
-# ── Main consumer loop ─────────────────────────────────────────
+# Main consumer loop
 def run():
     logger.info("Loading ArcFace model...")
     face_engine.load()
