@@ -113,6 +113,8 @@ def ingest_event(event_id: str, drive_url: str):
         files = drive_service.list_images(folder_id)
         logger.info(f"Found {len(files)} images in Drive folder")
 
+        THROTTLE_SECONDS = 0.3
+
         for file in files:
             original_name = file.get('name', 'unknown')
             try:
@@ -152,6 +154,9 @@ def ingest_event(event_id: str, drive_url: str):
                 failed_files.append(original_name)
                 db.rollback()
                 continue
+            
+            finally:
+                time.sleep(THROTTLE_SECONDS)
 
         event.status = EventStatus.READY
         event.total_photos = processed

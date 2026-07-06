@@ -2,6 +2,8 @@ import re, io, logging
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from ..config.settings import settings
+import time
+import random
 
 logger = logging.getLogger(__name__)
 
@@ -72,14 +74,27 @@ class GoogleDriveService:
 
         return all_files
 
-    def download_to_memory(self, file_id: str) -> io.BytesIO:
-        request = self.service.files().get_media(fileId=file_id)
-        stream = io.BytesIO()
-        downloader = MediaIoBaseDownload(stream, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
-        stream.seek(0)
-        return stream
+    def download_to_memory(self, file_id: str, max_retries: int = 5) -> io.BytesIO:
+        for attempt in range(max_retries):
+            try:
+                request = self.service.files().get_media(fileId=file_id)
+                stream = io.BytesIO()
+                downloader = MediaIoBaseDownload(stream, request)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+                stream.seek(0)
+                return stream
+            except Exception as e:
+                # Google's abuse-block page raises HttpError 403, but the body
+                # is HTML rather than the usual JSON error — treat any 403
+                # here as rate-limiting and back off, since legitimate
+                # permission errors would surface earlier at the list() step.
+                if "403" in str(e) and attempt < max_retries - 1:
+                    wait = (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning(f"Rate limited on {file_id}, retrying in {wait:.1f}s (attempt {attempt+1}/{max_retries})")
+                    time.sleep(wait)
+                    continue
+                raise
 
 drive_service = GoogleDriveService()
