@@ -64,13 +64,9 @@ class FaceEngine:
         return []
 
     def _retry_with_padding(self, bgr, pad_ratio=0.4):
-        """Handles tightly-cropped headshots where the face fills most of the
-        frame — SCRFD's anchors expect more surrounding context. Adding a
-        reflected border gives the detector room without altering the actual
-        face region, so alignment/embedding quality is unaffected."""
         h, w = bgr.shape[:2]
         pad_h, pad_w = int(h * pad_ratio), int(w * pad_ratio)
-        padded = cv2.copyMakeBorder(bgr, pad_h, pad_h, pad_w, pad_w, cv2.BORDER_REFLECT)
+        padded = cv2.copyMakeBorder(bgr, pad_h, pad_h, pad_w, pad_w, cv2.BORDER_REPLICATE)
 
         original_thresh = self._app.det_model.det_thresh
         for thresh in (original_thresh, 0.3, 0.2):
@@ -78,8 +74,17 @@ class FaceEngine:
             faces = self._app.get(padded)
             if faces:
                 self._app.det_model.det_thresh = original_thresh
-                logger.info(f"Face found after padding retry at threshold {thresh}")
-                return faces
+                # Discard faces whose bbox center falls in the padding margin —
+                # these can only be padding artifacts, never real content.
+                valid_faces = []
+                for f in faces:
+                    x0, y0, x1, y1 = f.bbox
+                    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+                    if pad_w <= cx <= pad_w + w and pad_h <= cy <= pad_h + h:
+                        valid_faces.append(f)
+                if valid_faces:
+                    logger.info(f"Face found after padding retry at threshold {thresh} ({len(valid_faces)} valid of {len(faces)} raw)")
+                    return valid_faces
         self._app.det_model.det_thresh = original_thresh
         return []
 face_engine = FaceEngine()
