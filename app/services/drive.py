@@ -18,7 +18,24 @@ IMAGE_MIME_TYPES = [
 
 class GoogleDriveService:
     def __init__(self):
-        self.service = build('drive', 'v3', developerKey=settings.google_drive_api_key)
+        self._service = None
+
+    def get_service(self):
+        if self._service is None:
+            self._service = build('drive', 'v3', developerKey=settings.google_drive_api_key, cache_discovery=False)
+        return self._service
+
+    def _execute_with_retry(self, fn, max_retries=3):
+        for attempt in range(max_retries):
+            try:
+                srv = self.get_service()
+                return fn(srv)
+            except (OSError, ConnectionResetError) as e:
+                logger.warning(f"Socket connection reset ({e}), rebuilding Google Drive service client (attempt {attempt+1}/{max_retries})...")
+                self._service = None
+                time.sleep(1)
+                if attempt == max_retries - 1:
+                    raise
 
     def extract_folder_id(self, url: str) -> str:
         match = re.search(r"folders/([a-zA-Z0-9-_]+)", url)
@@ -34,12 +51,15 @@ class GoogleDriveService:
         files = []
         page_token = None
         while True:
-            results = self.service.files().list(
-                q=query,
-                fields="nextPageToken, files(id,name,mimeType)",
-                pageSize=1000,
-                pageToken=page_token,
-            ).execute()
+            current_token = page_token
+            def req(srv):
+                return srv.files().list(
+                    q=query,
+                    fields="nextPageToken, files(id,name,mimeType)",
+                    pageSize=1000,
+                    pageToken=current_token,
+                ).execute()
+            results = self._execute_with_retry(req)
             files.extend(results.get('files', []))
             page_token = results.get('nextPageToken')
             if not page_token:
@@ -52,12 +72,15 @@ class GoogleDriveService:
         folders = []
         page_token = None
         while True:
-            results = self.service.files().list(
-                q=query,
-                fields="nextPageToken, files(id,name)",
-                pageSize=1000,
-                pageToken=page_token,
-            ).execute()
+            current_token = page_token
+            def req(srv):
+                return srv.files().list(
+                    q=query,
+                    fields="nextPageToken, files(id,name)",
+                    pageSize=1000,
+                    pageToken=current_token,
+                ).execute()
+            results = self._execute_with_retry(req)
             folders.extend(results.get('files', []))
             page_token = results.get('nextPageToken')
             if not page_token:
@@ -77,7 +100,8 @@ class GoogleDriveService:
     def download_to_memory(self, file_id: str, max_retries: int = 5) -> io.BytesIO:
         for attempt in range(max_retries):
             try:
-                request = self.service.files().get_media(fileId=file_id)
+                srv = self.get_service()
+                request = srv.files().get_media(fileId=file_id)
                 stream = io.BytesIO()
                 downloader = MediaIoBaseDownload(stream, request)
                 done = False
@@ -85,6 +109,12 @@ class GoogleDriveService:
                     _, done = downloader.next_chunk()
                 stream.seek(0)
                 return stream
+            except (OSError, ConnectionResetError) as e:
+                logger.warning(f"Socket connection reset on download ({e}), rebuilding client (attempt {attempt+1}/{max_retries})...")
+                self._service = None
+                time.sleep(1)
+                if attempt == max_retries - 1:
+                    raise
             except Exception as e:
                 # Google's abuse-block page raises HttpError 403, but the body
                 # is HTML rather than the usual JSON error — treat any 403

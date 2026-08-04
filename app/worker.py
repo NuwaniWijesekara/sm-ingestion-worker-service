@@ -41,6 +41,7 @@ class Event(Base):
     drive_url       = Column(String, nullable=True)
     cover_photo_url = Column(String, nullable=True)
     qr_token        = Column(String, unique=True, nullable=False)
+    username        = Column(String, unique=True, nullable=True)
     status          = Column(SAEnum(EventStatus), default=EventStatus.PENDING, nullable=False)
     photographer_id = Column(String, nullable=True)
     created_at      = Column(DateTime, default=datetime.utcnow)
@@ -68,7 +69,7 @@ class Face(Base):
     created_at     = Column(DateTime, default=datetime.utcnow)
     image          = relationship("Image", back_populates="faces")
 
-engine = create_engine(settings.database_url, pool_pre_ping=True)
+engine = create_engine(settings.database_url, pool_pre_ping=True, pool_recycle=300)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 #Redis Stream setup 
