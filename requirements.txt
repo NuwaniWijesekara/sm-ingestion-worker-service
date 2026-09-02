@@ -5,13 +5,11 @@ numpy
 aiofiles
 Pillow
 opencv-python-headless
-insightface
-onnxruntime
 celery
 redis
 boto3
 google-api-python-client
-pgvector
 pydantic
 pydantic-settings
 pillow-heif
+

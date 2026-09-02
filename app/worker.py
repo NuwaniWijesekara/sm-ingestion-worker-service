@@ -11,7 +11,6 @@ from pathlib import Path
 import redis
 from sqlalchemy import JSON, create_engine, text, Column, String, DateTime, Enum as SAEnum, ForeignKey, Integer
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base
-from pgvector.sqlalchemy import Vector
 import uuid, enum
 from datetime import datetime
 
@@ -61,13 +60,13 @@ class Image(Base):
     faces          = relationship("Face", back_populates="image", cascade="all, delete-orphan")
 
 class Face(Base):
-    """One row per detected face — embedding only, indexable for ANN search."""
+    """One row per detected face — stores AWS Rekognition FaceId."""
     __tablename__ = "faces"
-    id             = Column(String, primary_key=True, default=_uuid)
-    image_id       = Column(String, ForeignKey("images.id", ondelete="CASCADE"), nullable=False, index=True)
-    embedding      = Column(Vector(512), nullable=False)
-    created_at     = Column(DateTime, default=datetime.utcnow)
-    image          = relationship("Image", back_populates="faces")
+    id                  = Column(String, primary_key=True, default=_uuid)
+    image_id            = Column(String, ForeignKey("images.id", ondelete="CASCADE"), nullable=False, index=True)
+    rekognition_face_id = Column(String, nullable=False, index=True)
+    created_at          = Column(DateTime, default=datetime.utcnow)
+    image               = relationship("Image", back_populates="faces")
 
 engine = create_engine(settings.database_url, pool_pre_ping=True, pool_recycle=300)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -129,7 +128,12 @@ def ingest_event(event_id: str, drive_url: str):
                 thumb_bytes = s3_service.make_thumbnail(image_bytes)
                 thumb_url = s3_service.upload_thumbnail(thumb_bytes, thumb_key)
 
-                embeddings = face_engine.extract_embeddings(image_bytes)
+                # Call AWS Rekognition index_faces on the uploaded S3 photo object
+                face_ids = face_engine.index_faces(
+                    bucket=s3_service.bucket,
+                    photo_key=photo_key,
+                    collection_id=event_id
+                )
 
                 # One Image row per photo — always created, regardless of face count
                 img = Image(
@@ -139,16 +143,16 @@ def ingest_event(event_id: str, drive_url: str):
                 db.add(img)
                 db.flush()  # get img.id before creating Face rows
 
-                # One Face row per detected embedding
-                for emb in embeddings:
-                    face = Face(image_id=img.id, embedding=emb.tolist())
+                # One Face row per returned Rekognition FaceId
+                for fid in face_ids:
+                    face = Face(image_id=img.id, rekognition_face_id=fid)
                     db.add(face)
 
                 db.commit()
 
                 processed += 1
-                faces_found += len(embeddings)
-                logger.info(f"✓ {original_name}: {len(embeddings)} face(s)")
+                faces_found += len(face_ids)
+                logger.info(f"✓ {original_name}: {len(face_ids)} face(s)")
 
             except Exception as e:
                 logger.error(f"Failed to process {original_name}: {e}")
@@ -185,8 +189,6 @@ def ingest_event(event_id: str, drive_url: str):
 
 # Main consumer loop
 def run():
-    logger.info("Loading ArcFace model...")
-    face_engine.load()
     logger.info("✓ Ingestion worker started — listening on Redis Stream")
 
     ensure_stream_group()
