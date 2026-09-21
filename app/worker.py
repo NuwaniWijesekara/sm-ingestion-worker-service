@@ -42,7 +42,7 @@ class Event(Base):
     qr_token        = Column(String, unique=True, nullable=False)
     username        = Column(String, unique=True, nullable=True)
     status          = Column(SAEnum(EventStatus), default=EventStatus.PENDING, nullable=False)
-    photographer_id = Column(String, nullable=True)
+    owner_id        = Column(String, nullable=True)
     created_at      = Column(DateTime, default=datetime.utcnow)
     total_photos    = Column(Integer, default=0)
     failed_files    = Column(JSON, nullable=True)
