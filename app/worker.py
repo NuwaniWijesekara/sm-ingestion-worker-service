@@ -18,6 +18,7 @@ from .config.settings import settings
 from .services.drive import drive_service
 from .services.s3 import s3_service
 from .services.face_engine import face_engine
+from .services.watermark import Watermarker, watermark_service
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -47,6 +48,7 @@ class Event(Base):
     total_photos    = Column(Integer, default=0)
     failed_files    = Column(JSON, nullable=True)
     is_watermarked  = Column(Boolean, default=False, nullable=False)
+    watermark_logo_url = Column(String, nullable=True)
     images          = relationship("Image", back_populates="event", cascade="all, delete-orphan")
 
 class Image(Base):
@@ -90,7 +92,21 @@ def ensure_stream_group():
         else:
             raise
 
-# Core ingestion logic 
+def _event_watermarker(event) -> Watermarker:
+    """The event's package logo, downloaded once for the whole ingestion
+    task — or the default (WATERMARK_LOGO_PATH / text) when the event has no
+    logo or it can't be fetched. A bad logo never fails the ingestion."""
+    if not event.watermark_logo_url:
+        return watermark_service.default
+    try:
+        logo_bytes = s3_service.fetch_bytes(event.watermark_logo_url)
+    except Exception as e:
+        logger.warning(f"Could not fetch watermark logo {event.watermark_logo_url}: {e} — using default watermark")
+        return watermark_service.default
+    logger.info("Using the package's watermark logo for this event")
+    return watermark_service.for_logo_bytes(logo_bytes)
+
+# Core ingestion logic
 def ingest_event(event_id: str, drive_url: str):
     db = SessionLocal()
     processed = 0
@@ -114,9 +130,11 @@ def ingest_event(event_id: str, drive_url: str):
         folder_id = drive_service.extract_folder_id(drive_url)
         files = drive_service.list_images(folder_id)
         logger.info(f"Found {len(files)} images in Drive folder")
-        is_watermarked = bool(event.is_watermarked)
-        if is_watermarked:
-            logger.info("Event is watermarked — display versions will carry the watermark")
+        # One Watermarker per task: the logo is fetched here, once, and
+        # reused for every photo below; it's released when the task ends.
+        watermarker = _event_watermarker(event) if event.is_watermarked else None
+        if watermarker:
+            logger.info("Event is watermarked — display versions and thumbnails will carry the watermark")
 
         THROTTLE_SECONDS = 0.3
 
@@ -131,7 +149,7 @@ def ingest_event(event_id: str, drive_url: str):
                 display_key = f"events/{event_id}/display/{base_name}.jpg"
 
                 s3_url = s3_service.strip_exif_and_upload(image_bytes, photo_key)
-                thumb_bytes = s3_service.make_thumbnail(image_bytes, watermark=is_watermarked)
+                thumb_bytes = s3_service.make_thumbnail(image_bytes, watermarker=watermarker)
                 thumb_url = s3_service.upload_thumbnail(thumb_bytes, thumb_key)
 
                 # Call AWS Rekognition index_faces on the uploaded S3 photo object
@@ -143,8 +161,8 @@ def ingest_event(event_id: str, drive_url: str):
 
                 # Display version — Rekognition above only ever sees the clean
                 # original; the watermark is applied to this separate copy.
-                if is_watermarked:
-                    enhanced_url = s3_service.watermark_and_upload(image_bytes, display_key)
+                if watermarker:
+                    enhanced_url = s3_service.watermark_and_upload(image_bytes, display_key, watermarker)
                 else:
                     enhanced_url = s3_service.copy_object(photo_key, display_key)
 

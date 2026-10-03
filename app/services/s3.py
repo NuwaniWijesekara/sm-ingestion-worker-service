@@ -1,8 +1,13 @@
 import io, boto3
+import urllib.request
+from urllib.parse import urlparse, unquote
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 from ..config.settings import settings
-from .watermark import watermark_service
+from .watermark import Watermarker
+
+MAX_FETCH_BYTES = 5 * 1024 * 1024
+FETCH_TIMEOUT_SECONDS = 10
 
 class S3Service:
     def __init__(self):
@@ -26,13 +31,13 @@ class S3Service:
         self.client.put_object(Bucket=self.bucket, Key=key, Body=clean.getvalue(), ContentType="image/jpeg")
         return f"https://{self.bucket}.s3.{settings.aws_region}.amazonaws.com/{key}"
 
-    def make_thumbnail(self, image_bytes: bytes, size=(400, 400), watermark: bool = False) -> bytes:
+    def make_thumbnail(self, image_bytes: bytes, size=(400, 400), watermarker: Watermarker | None = None) -> bytes:
         img = self._open_corrected(image_bytes)
         img.thumbnail(size, Image.LANCZOS)
-        if watermark:
+        if watermarker:
             # Same bottom-right watermark as the display version, applied
             # after resizing so it stays proportionate to the thumbnail.
-            img = watermark_service.apply(img)
+            img = watermarker.apply(img)
         stream = io.BytesIO()
         img.save(stream, format="JPEG", quality=82)
         return stream.getvalue()
@@ -41,11 +46,11 @@ class S3Service:
         self.client.put_object(Bucket=self.bucket, Key=key, Body=thumb_bytes, ContentType="image/jpeg")
         return f"https://{self.bucket}.s3.{settings.aws_region}.amazonaws.com/{key}"
 
-    def watermark_and_upload(self, image_bytes: bytes, key: str) -> str:
+    def watermark_and_upload(self, image_bytes: bytes, key: str, watermarker: Watermarker) -> str:
         """Display version for watermarked events: bottom-right watermark on
         the orientation-corrected, EXIF-stripped image."""
         img = self._open_corrected(image_bytes)
-        body = watermark_service.apply_to_jpeg(img)
+        body = watermarker.apply_to_jpeg(img)
         self.client.put_object(Bucket=self.bucket, Key=key, Body=body, ContentType="image/jpeg")
         return f"https://{self.bucket}.s3.{settings.aws_region}.amazonaws.com/{key}"
 
@@ -57,5 +62,21 @@ class S3Service:
             ContentType="image/jpeg", MetadataDirective="REPLACE",
         )
         return f"https://{self.bucket}.s3.{settings.aws_region}.amazonaws.com/{dst_key}"
+
+    def fetch_bytes(self, url: str) -> bytes:
+        """Download `url` — via the S3 API when it points into our (private)
+        bucket, otherwise plain HTTP(S). Capped at MAX_FETCH_BYTES."""
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            raise ValueError(f"Unsupported URL scheme: {parsed.scheme}")
+        if parsed.hostname and parsed.hostname.startswith(f"{self.bucket}.s3."):
+            body = self.client.get_object(Bucket=self.bucket, Key=unquote(parsed.path.lstrip("/")))["Body"]
+            data = body.read(MAX_FETCH_BYTES + 1)
+        else:
+            with urllib.request.urlopen(url, timeout=FETCH_TIMEOUT_SECONDS) as resp:
+                data = resp.read(MAX_FETCH_BYTES + 1)
+        if len(data) > MAX_FETCH_BYTES:
+            raise ValueError(f"File at {url} exceeds {MAX_FETCH_BYTES} bytes")
+        return data
 
 s3_service = S3Service()
