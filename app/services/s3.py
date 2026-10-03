@@ -26,9 +26,13 @@ class S3Service:
         self.client.put_object(Bucket=self.bucket, Key=key, Body=clean.getvalue(), ContentType="image/jpeg")
         return f"https://{self.bucket}.s3.{settings.aws_region}.amazonaws.com/{key}"
 
-    def make_thumbnail(self, image_bytes: bytes, size=(400, 400)) -> bytes:
+    def make_thumbnail(self, image_bytes: bytes, size=(400, 400), watermark: bool = False) -> bytes:
         img = self._open_corrected(image_bytes)
         img.thumbnail(size, Image.LANCZOS)
+        if watermark:
+            # Same bottom-right watermark as the display version, applied
+            # after resizing so it stays proportionate to the thumbnail.
+            img = watermark_service.apply(img)
         stream = io.BytesIO()
         img.save(stream, format="JPEG", quality=82)
         return stream.getvalue()

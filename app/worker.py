@@ -131,7 +131,7 @@ def ingest_event(event_id: str, drive_url: str):
                 display_key = f"events/{event_id}/display/{base_name}.jpg"
 
                 s3_url = s3_service.strip_exif_and_upload(image_bytes, photo_key)
-                thumb_bytes = s3_service.make_thumbnail(image_bytes)
+                thumb_bytes = s3_service.make_thumbnail(image_bytes, watermark=is_watermarked)
                 thumb_url = s3_service.upload_thumbnail(thumb_bytes, thumb_key)
 
                 # Call AWS Rekognition index_faces on the uploaded S3 photo object

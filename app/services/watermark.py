@@ -1,14 +1,17 @@
-import io
+import io, logging
 from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 from ..config.settings import settings
 
 # Watermark is confined to the bottom-right corner so it never overlaps faces
-# in the middle of the frame. It is only ever applied to the display copy —
-# Rekognition always indexes the untouched original.
+# in the middle of the frame. It is only applied to the display copy and the
+# thumbnail — Rekognition always indexes the untouched original.
 MARGIN_RATIO = 0.05   # 5% of width / height from the right / bottom edges
 WIDTH_RATIO  = 0.18   # watermark spans ~18% of the image width
 OPACITY      = 0.6
+
+SERVICE_ROOT = Path(__file__).resolve().parents[2]
+logger = logging.getLogger(__name__)
 
 class WatermarkService:
     def __init__(self):
@@ -16,9 +19,15 @@ class WatermarkService:
 
     @staticmethod
     def _load_logo(path: str):
-        if path and Path(path).is_file():
-            return Image.open(path).convert("RGBA")
-        return None
+        if not path:
+            return None
+        logo_path = Path(path)
+        if not logo_path.is_absolute():
+            logo_path = SERVICE_ROOT / logo_path
+        if not logo_path.is_file():
+            logger.warning(f"Watermark logo not found at {logo_path} — using text watermark")
+            return None
+        return Image.open(logo_path).convert("RGBA")
 
     @staticmethod
     def _load_font(size: int):
