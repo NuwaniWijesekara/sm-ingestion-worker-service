@@ -6,10 +6,10 @@ def patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
     return orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
 socket.getaddrinfo = patched_getaddrinfo
 
-import logging, time
+import logging, re, time
 from pathlib import Path
 import redis
-from sqlalchemy import JSON, Boolean, create_engine, text, Column, String, DateTime, Enum as SAEnum, ForeignKey, Integer
+from sqlalchemy import JSON, Boolean, create_engine, Column, String, DateTime, Enum as SAEnum, ForeignKey, Integer
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base
 import uuid, enum
 from datetime import datetime
@@ -106,6 +106,14 @@ def _event_watermarker(event) -> Watermarker:
     logger.info("Using the package's watermark logo for this event")
     return watermark_service.for_logo_bytes(logo_bytes)
 
+def _object_basename(original_name: str, drive_file_id: str) -> str:
+    """S3-safe, collision-free name for one Drive file. The stem is
+    sanitized (characters like '?' or '#' would break the stored URLs) and
+    suffixed with part of the Drive file id, so 'IMG_1.jpg' and 'IMG_1.png',
+    or same-named files in different subfolders, don't overwrite each other."""
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(original_name).stem).strip("._") or "photo"
+    return f"{stem[:80]}_{drive_file_id[:12]}"
+
 # Core ingestion logic
 def ingest_event(event_id: str, drive_url: str):
     db = SessionLocal()
@@ -143,7 +151,7 @@ def ingest_event(event_id: str, drive_url: str):
             try:
                 image_bytes = drive_service.download_to_memory(file['id']).getvalue()
 
-                base_name = Path(original_name).stem
+                base_name = _object_basename(original_name, file['id'])
                 photo_key = f"events/{event_id}/photos/{base_name}.jpg"
                 thumb_key = f"events/{event_id}/thumbs/thumb_{base_name}.jpg"
                 display_key = f"events/{event_id}/display/{base_name}.jpg"

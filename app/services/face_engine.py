@@ -20,10 +20,6 @@ class FaceEngine:
             cls._instance.known_collections = set()
         return cls._instance
 
-    def load(self):
-        """No-op retained for backwards compatibility."""
-        pass
-
     def ensure_collection(self, collection_id: str):
         if collection_id in self.known_collections:
             return

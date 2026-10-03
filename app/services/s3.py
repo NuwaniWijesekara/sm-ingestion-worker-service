@@ -6,6 +6,8 @@ from pillow_heif import register_heif_opener
 from ..config.settings import settings
 from .watermark import Watermarker
 
+register_heif_opener()  # lets Pillow open the HEIC/HEIF files drive.py lists
+
 MAX_FETCH_BYTES = 5 * 1024 * 1024
 FETCH_TIMEOUT_SECONDS = 10
 
