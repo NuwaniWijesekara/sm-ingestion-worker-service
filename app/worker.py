@@ -1,12 +1,16 @@
-"""
-worker.py — Redis Stream consumer (replaces Celery)
-Listens on 'photo.ingest' stream, processes each event.
-"""
-import logging, time
+
+import socket
+# Force IPv4 to prevent connection timeouts on systems with broken IPv6 routing
+orig_getaddrinfo = socket.getaddrinfo
+def patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    return orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+socket.getaddrinfo = patched_getaddrinfo
+
+import logging, re, time
+from pathlib import Path
 import redis
-from sqlalchemy import create_engine, text, Column, String, DateTime, Enum as SAEnum, ForeignKey, Integer
+from sqlalchemy import JSON, Boolean, create_engine, Column, String, DateTime, Enum as SAEnum, ForeignKey, Integer
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base
-from pgvector.sqlalchemy import Vector
 import uuid, enum
 from datetime import datetime
 
@@ -14,11 +18,12 @@ from .config.settings import settings
 from .services.drive import drive_service
 from .services.s3 import s3_service
 from .services.face_engine import face_engine
+from .services.watermark import Watermarker, watermark_service
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── DB Models (read/write events + images) ─────────────────────
+# DB Models (read/write events + images)
 Base = declarative_base()
 def _uuid(): return str(uuid.uuid4())
 
@@ -36,10 +41,14 @@ class Event(Base):
     drive_url       = Column(String, nullable=True)
     cover_photo_url = Column(String, nullable=True)
     qr_token        = Column(String, unique=True, nullable=False)
+    username        = Column(String, unique=True, nullable=True)
     status          = Column(SAEnum(EventStatus), default=EventStatus.PENDING, nullable=False)
-    photographer_id = Column(String, nullable=True)
+    owner_id        = Column(String, nullable=True)
     created_at      = Column(DateTime, default=datetime.utcnow)
     total_photos    = Column(Integer, default=0)
+    failed_files    = Column(JSON, nullable=True)
+    is_watermarked  = Column(Boolean, default=False, nullable=False)
+    watermark_logo_url = Column(String, nullable=True)
     images          = relationship("Image", back_populates="event", cascade="all, delete-orphan")
 
 class Image(Base):
@@ -48,15 +57,25 @@ class Image(Base):
     event_id       = Column(String, ForeignKey("events.id", ondelete="CASCADE"), nullable=False)
     s3_url         = Column(String, nullable=False)
     thumbnail_url  = Column(String, nullable=True)
+    enhanced_url   = Column(String, nullable=True)
     filename       = Column(String, nullable=False)
-    face_embedding = Column(Vector(512), nullable=True)
     created_at     = Column(DateTime, default=datetime.utcnow)
     event          = relationship("Event", back_populates="images")
+    faces          = relationship("Face", back_populates="image", cascade="all, delete-orphan")
 
-engine = create_engine(settings.database_url, pool_pre_ping=True)
+class Face(Base):
+    """One row per detected face — stores AWS Rekognition FaceId."""
+    __tablename__ = "faces"
+    id                  = Column(String, primary_key=True, default=_uuid)
+    image_id            = Column(String, ForeignKey("images.id", ondelete="CASCADE"), nullable=False, index=True)
+    rekognition_face_id = Column(String, nullable=False, index=True)
+    created_at          = Column(DateTime, default=datetime.utcnow)
+    image               = relationship("Image", back_populates="faces")
+
+engine = create_engine(settings.database_url, pool_pre_ping=True, pool_recycle=300)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# ── Redis Stream setup ─────────────────────────────────────────
+#Redis Stream setup 
 r = redis.from_url( settings.redis_url,
     decode_responses=True,
     socket_timeout=10,          # wait up to 10s for a response
@@ -73,11 +92,34 @@ def ensure_stream_group():
         else:
             raise
 
-# ── Core ingestion logic ───────────────────────────────────────
+def _event_watermarker(event) -> Watermarker:
+    """The event's package logo, downloaded once for the whole ingestion
+    task — or the default (WATERMARK_LOGO_PATH / text) when the event has no
+    logo or it can't be fetched. A bad logo never fails the ingestion."""
+    if not event.watermark_logo_url:
+        return watermark_service.default
+    try:
+        logo_bytes = s3_service.fetch_bytes(event.watermark_logo_url)
+    except Exception as e:
+        logger.warning(f"Could not fetch watermark logo {event.watermark_logo_url}: {e} — using default watermark")
+        return watermark_service.default
+    logger.info("Using the package's watermark logo for this event")
+    return watermark_service.for_logo_bytes(logo_bytes)
+
+def _object_basename(original_name: str, drive_file_id: str) -> str:
+    """S3-safe, collision-free name for one Drive file. The stem is
+    sanitized (characters like '?' or '#' would break the stored URLs) and
+    suffixed with part of the Drive file id, so 'IMG_1.jpg' and 'IMG_1.png',
+    or same-named files in different subfolders, don't overwrite each other."""
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(original_name).stem).strip("._") or "photo"
+    return f"{stem[:80]}_{drive_file_id[:12]}"
+
+# Core ingestion logic
 def ingest_event(event_id: str, drive_url: str):
     db = SessionLocal()
     processed = 0
     faces_found = 0
+    failed_files = []
     try:
         event = db.query(Event).filter(Event.id == event_id).first()
         if not event:
@@ -87,49 +129,90 @@ def ingest_event(event_id: str, drive_url: str):
         event.status = EventStatus.PROCESSING
         db.commit()
 
+        deleted = db.query(Image).filter(Image.event_id == event_id).delete()
+        db.commit()
+        if deleted:
+            logger.info(f"Cleared {deleted} existing image(s) before re-ingestion")
+
+
         folder_id = drive_service.extract_folder_id(drive_url)
         files = drive_service.list_images(folder_id)
         logger.info(f"Found {len(files)} images in Drive folder")
+        # One Watermarker per task: the logo is fetched here, once, and
+        # reused for every photo below; it's released when the task ends.
+        watermarker = _event_watermarker(event) if event.is_watermarked else None
+        if watermarker:
+            logger.info("Event is watermarked — display versions and thumbnails will carry the watermark")
+
+        THROTTLE_SECONDS = 0.3
 
         for file in files:
+            original_name = file.get('name', 'unknown')
             try:
                 image_bytes = drive_service.download_to_memory(file['id']).getvalue()
 
-                # Upload original (EXIF stripped) to S3
-                photo_key = f"events/{event_id}/photos/{file['name']}"
-                s3_url = s3_service.strip_exif_and_upload(image_bytes, photo_key)
+                base_name = _object_basename(original_name, file['id'])
+                photo_key = f"events/{event_id}/photos/{base_name}.jpg"
+                thumb_key = f"events/{event_id}/thumbs/thumb_{base_name}.jpg"
+                display_key = f"events/{event_id}/display/{base_name}.jpg"
 
-                # Thumbnail
-                thumb_bytes = s3_service.make_thumbnail(image_bytes)
-                thumb_key = f"events/{event_id}/thumbs/thumb_{file['name']}"
+                s3_url = s3_service.strip_exif_and_upload(image_bytes, photo_key)
+                thumb_bytes = s3_service.make_thumbnail(image_bytes, watermarker=watermarker)
                 thumb_url = s3_service.upload_thumbnail(thumb_bytes, thumb_key)
 
-                # ArcFace embeddings
-                embeddings = face_engine.extract_embeddings(image_bytes)
+                # Call AWS Rekognition index_faces on the uploaded S3 photo object
+                face_ids = face_engine.index_faces(
+                    bucket=s3_service.bucket,
+                    photo_key=photo_key,
+                    collection_id=event_id
+                )
 
+                # Display version — Rekognition above only ever sees the clean
+                # original; the watermark is applied to this separate copy.
+                if watermarker:
+                    enhanced_url = s3_service.watermark_and_upload(image_bytes, display_key, watermarker)
+                else:
+                    enhanced_url = s3_service.copy_object(photo_key, display_key)
+
+                # One Image row per photo — always created, regardless of face count
                 img = Image(
                     event_id=event_id, s3_url=s3_url, thumbnail_url=thumb_url,
-                    filename=file['name'],
-                    face_embedding=embeddings[0].tolist() if embeddings else None
+                    enhanced_url=enhanced_url, filename=original_name
                 )
                 db.add(img)
+                db.flush()  # get img.id before creating Face rows
+
+                # One Face row per returned Rekognition FaceId
+                for fid in face_ids:
+                    face = Face(image_id=img.id, rekognition_face_id=fid)
+                    db.add(face)
+
                 db.commit()
 
                 processed += 1
-                faces_found += len(embeddings)
-                logger.info(f"✓ {file['name']}: {len(embeddings)} face(s)")
+                faces_found += len(face_ids)
+                logger.info(f"✓ {original_name}: {len(face_ids)} face(s)")
 
             except Exception as e:
-                logger.error(f"Failed to process {file.get('name')}: {e}")
+                logger.error(f"Failed to process {original_name}: {e}")
+                failed_files.append(original_name)
+                db.rollback()
                 continue
+            
+            finally:
+                time.sleep(THROTTLE_SECONDS)
 
         event.status = EventStatus.READY
         event.total_photos = processed
+        event.failed_files = failed_files or None 
         if not event.cover_photo_url:
             first = db.query(Image).filter(Image.event_id == event_id).first()
             if first:
                 event.cover_photo_url = first.thumbnail_url
         db.commit()
+        
+        if failed_files:
+            logger.warning(f"⚠️ {len(failed_files)} file(s) failed: {failed_files}")
         logger.info(f"✅ Ingestion complete: {processed} photos, {faces_found} faces")
 
     except Exception as e:
@@ -143,10 +226,8 @@ def ingest_event(event_id: str, drive_url: str):
     finally:
         db.close()
 
-# ── Main consumer loop ─────────────────────────────────────────
+# Main consumer loop
 def run():
-    logger.info("Loading ArcFace model...")
-    face_engine.load()
     logger.info("✓ Ingestion worker started — listening on Redis Stream")
 
     ensure_stream_group()

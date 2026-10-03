@@ -1,0 +1,13 @@
+from PIL import Image
+
+files = [
+    r"C:\Users\Nuwani\Downloads\1443_v9_bc.jpg",
+    r"C:\Users\Nuwani\Downloads\American-actress-Zoe-Saldana-2018.webp",
+    r"C:\Users\Nuwani\Downloads\Canadian-actor-Keanu-Reeves-attends-the-premiere-of-AppleTVs-Outcome-040726-be40ada26b2c42d0b628e01f90cf1038.jpg",
+    r"C:\Users\Nuwani\Downloads\images (3).jpeg",
+    r"C:\Users\Nuwani\Downloads\WhatsApp Image 2026-01-25 at 09.54.49 (1).jpeg"
+]
+
+for f in files:
+    img = Image.open(f)
+    print(f, img.size)
