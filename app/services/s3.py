@@ -2,6 +2,7 @@ import io, boto3
 from PIL import Image, ImageOps
 from pillow_heif import register_heif_opener
 from ..config.settings import settings
+from .watermark import watermark_service
 
 class S3Service:
     def __init__(self):
@@ -35,5 +36,22 @@ class S3Service:
     def upload_thumbnail(self, thumb_bytes: bytes, key: str) -> str:
         self.client.put_object(Bucket=self.bucket, Key=key, Body=thumb_bytes, ContentType="image/jpeg")
         return f"https://{self.bucket}.s3.{settings.aws_region}.amazonaws.com/{key}"
+
+    def watermark_and_upload(self, image_bytes: bytes, key: str) -> str:
+        """Display version for watermarked events: bottom-right watermark on
+        the orientation-corrected, EXIF-stripped image."""
+        img = self._open_corrected(image_bytes)
+        body = watermark_service.apply_to_jpeg(img)
+        self.client.put_object(Bucket=self.bucket, Key=key, Body=body, ContentType="image/jpeg")
+        return f"https://{self.bucket}.s3.{settings.aws_region}.amazonaws.com/{key}"
+
+    def copy_object(self, src_key: str, dst_key: str) -> str:
+        """Server-side S3 copy — display version for non-watermarked events."""
+        self.client.copy_object(
+            Bucket=self.bucket, Key=dst_key,
+            CopySource={"Bucket": self.bucket, "Key": src_key},
+            ContentType="image/jpeg", MetadataDirective="REPLACE",
+        )
+        return f"https://{self.bucket}.s3.{settings.aws_region}.amazonaws.com/{dst_key}"
 
 s3_service = S3Service()

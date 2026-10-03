@@ -9,7 +9,7 @@ socket.getaddrinfo = patched_getaddrinfo
 import logging, time
 from pathlib import Path
 import redis
-from sqlalchemy import JSON, create_engine, text, Column, String, DateTime, Enum as SAEnum, ForeignKey, Integer
+from sqlalchemy import JSON, Boolean, create_engine, text, Column, String, DateTime, Enum as SAEnum, ForeignKey, Integer
 from sqlalchemy.orm import sessionmaker, relationship, declarative_base
 import uuid, enum
 from datetime import datetime
@@ -46,6 +46,7 @@ class Event(Base):
     created_at      = Column(DateTime, default=datetime.utcnow)
     total_photos    = Column(Integer, default=0)
     failed_files    = Column(JSON, nullable=True)
+    is_watermarked  = Column(Boolean, default=False, nullable=False)
     images          = relationship("Image", back_populates="event", cascade="all, delete-orphan")
 
 class Image(Base):
@@ -54,6 +55,7 @@ class Image(Base):
     event_id       = Column(String, ForeignKey("events.id", ondelete="CASCADE"), nullable=False)
     s3_url         = Column(String, nullable=False)
     thumbnail_url  = Column(String, nullable=True)
+    enhanced_url   = Column(String, nullable=True)
     filename       = Column(String, nullable=False)
     created_at     = Column(DateTime, default=datetime.utcnow)
     event          = relationship("Event", back_populates="images")
@@ -112,6 +114,9 @@ def ingest_event(event_id: str, drive_url: str):
         folder_id = drive_service.extract_folder_id(drive_url)
         files = drive_service.list_images(folder_id)
         logger.info(f"Found {len(files)} images in Drive folder")
+        is_watermarked = bool(event.is_watermarked)
+        if is_watermarked:
+            logger.info("Event is watermarked — display versions will carry the watermark")
 
         THROTTLE_SECONDS = 0.3
 
@@ -123,6 +128,7 @@ def ingest_event(event_id: str, drive_url: str):
                 base_name = Path(original_name).stem
                 photo_key = f"events/{event_id}/photos/{base_name}.jpg"
                 thumb_key = f"events/{event_id}/thumbs/thumb_{base_name}.jpg"
+                display_key = f"events/{event_id}/display/{base_name}.jpg"
 
                 s3_url = s3_service.strip_exif_and_upload(image_bytes, photo_key)
                 thumb_bytes = s3_service.make_thumbnail(image_bytes)
@@ -135,10 +141,17 @@ def ingest_event(event_id: str, drive_url: str):
                     collection_id=event_id
                 )
 
+                # Display version — Rekognition above only ever sees the clean
+                # original; the watermark is applied to this separate copy.
+                if is_watermarked:
+                    enhanced_url = s3_service.watermark_and_upload(image_bytes, display_key)
+                else:
+                    enhanced_url = s3_service.copy_object(photo_key, display_key)
+
                 # One Image row per photo — always created, regardless of face count
                 img = Image(
                     event_id=event_id, s3_url=s3_url, thumbnail_url=thumb_url,
-                    filename=original_name
+                    enhanced_url=enhanced_url, filename=original_name
                 )
                 db.add(img)
                 db.flush()  # get img.id before creating Face rows

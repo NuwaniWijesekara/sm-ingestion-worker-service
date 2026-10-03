@@ -14,5 +14,9 @@ class Settings(BaseSettings):
     consumer_name:        str = "worker-1"
     face_det_size:        int = 1024
     face_det_thresh:      float = 0.4
+    # Free-tier watermark: a logo image (PNG with transparency) if the path
+    # exists, otherwise the placeholder text below is rendered instead.
+    watermark_logo_path:  str = ""
+    watermark_text:       str = "ScanMe"
 
 settings = Settings()
